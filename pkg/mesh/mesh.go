@@ -4,6 +4,7 @@ package mesh
 import (
 	"bytes"
 	"encoding/json"
+	"log"
 	"net"
 	"net/http"
 	"sync"
@@ -12,15 +13,15 @@ import (
 
 // Node represents a mesh node
 type Node struct {
-	ID          string    `json:"id"`
-	Name        string    `json:"name"`
-	IP          net.IP    `json:"ip"`
-	PublicKey   string    `json:"public_key"`
-	Endpoint    string    `json:"endpoint"`
-	Role        string    `json:"role"` // coordinator, agent, mikrotik
-	Status      string    `json:"status"` // online, offline, connecting
-	LastSeen    time.Time `json:"last_seen"`
-	Meta        map[string]string `json:"meta,omitempty"`
+	ID        string            `json:"id"`
+	Name      string            `json:"name"`
+	IP        net.IP            `json:"ip"`
+	PublicKey string            `json:"public_key"`
+	Endpoint  string            `json:"endpoint"`
+	Role      string            `json:"role"`   // coordinator, agent, mikrotik
+	Status    string            `json:"status"` // online, offline, connecting
+	LastSeen  time.Time         `json:"last_seen"`
+	Meta      map[string]string `json:"meta,omitempty"`
 }
 
 // Mesh represents the mesh network
@@ -113,17 +114,20 @@ func (m *Mesh) MarshalJSON() ([]byte, error) {
 
 // Heartbeat sends heartbeat to coordinator
 type Heartbeat struct {
-	NodeID    string    `json:"node_id"`
-	Status    string    `json:"status"`
-	Timestamp time.Time `json:"timestamp"`
+	NodeID    string            `json:"node_id"`
+	NodeName  string            `json:"node_name,omitempty"`
+	NodeIP    net.IP            `json:"node_ip,omitempty"`
+	Role      string            `json:"role,omitempty"`
+	Status    string            `json:"status"`
+	Timestamp time.Time         `json:"timestamp"`
 	Meta      map[string]string `json:"meta,omitempty"`
 }
 
 // HeartbeatResponse is the response to a heartbeat
 type HeartbeatResponse struct {
-	OK      bool      `json:"ok"`
-	Nodes   []*Node   `json:"nodes,omitempty"`
-	Message string    `json:"message,omitempty"`
+	OK      bool    `json:"ok"`
+	Nodes   []*Node `json:"nodes,omitempty"`
+	Message string  `json:"message,omitempty"`
 }
 
 // Coordinator represents the mesh coordinator
@@ -154,10 +158,53 @@ func (c *Coordinator) Stop() {
 
 // HandleHeartbeat handles heartbeat from agent
 func (c *Coordinator) HandleHeartbeat(hb *Heartbeat) *HeartbeatResponse {
-	c.mesh.UpdateNodeStatus(hb.NodeID, hb.Status)
+	c.mesh.mu.Lock()
+	defer c.mesh.mu.Unlock()
+
+	node := c.mesh.nodes[hb.NodeID]
+	if node == nil {
+		node := &Node{
+			ID:       hb.NodeID,
+			Name:     hb.NodeName,
+			IP:       hb.NodeIP,
+			Role:     hb.Role,
+			Status:   hb.Status,
+			LastSeen: time.Now(),
+			Meta:     hb.Meta,
+		}
+		if node.Name == "" {
+			node.Name = hb.NodeID
+		}
+		if node.Role == "" {
+			node.Role = "agent"
+		}
+		c.mesh.nodes[node.ID] = node
+	} else {
+		node.Status = hb.Status
+		node.LastSeen = time.Now()
+		if hb.NodeName != "" {
+			node.Name = hb.NodeName
+		}
+		if hb.NodeIP != nil {
+			node.IP = hb.NodeIP
+		}
+		if hb.Role != "" {
+			node.Role = hb.Role
+		}
+		if hb.Meta != nil {
+			node.Meta = hb.Meta
+		}
+	}
+
+	nodes := make([]*Node, 0, len(c.mesh.nodes))
+	for _, node := range c.mesh.nodes {
+		if node.Status == "online" {
+			nodes = append(nodes, node)
+		}
+	}
 	return &HeartbeatResponse{
 		OK:    true,
-		Nodes: c.mesh.GetOnlineNodes(),
+		Nodes: nodes,
 	}
 }
 
@@ -197,6 +244,7 @@ type Agent struct {
 	heartbeat   time.Duration
 	mesh        *Mesh
 	stopCh      chan struct{}
+	httpClient  *http.Client
 }
 
 // NewAgent creates a new agent
@@ -207,11 +255,13 @@ func NewAgent(node *Node, coordinator string, heartbeat time.Duration) *Agent {
 		heartbeat:   heartbeat,
 		mesh:        NewMesh(node),
 		stopCh:      make(chan struct{}),
+		httpClient:  &http.Client{Timeout: 5 * time.Second},
 	}
 }
 
 // Start starts the agent
 func (a *Agent) Start() {
+	go a.sendHeartbeat()
 	go a.heartbeatLoop()
 }
 
@@ -239,24 +289,29 @@ func (a *Agent) heartbeatLoop() {
 func (a *Agent) sendHeartbeat() {
 	hb := &Heartbeat{
 		NodeID:    a.node.ID,
+		NodeName:  a.node.Name,
+		NodeIP:    a.node.IP,
+		Role:      a.node.Role,
 		Status:    "online",
 		Timestamp: time.Now(),
+		Meta:      a.node.Meta,
 	}
 
 	data, err := json.Marshal(hb)
 	if err != nil {
+		log.Printf("mesh heartbeat marshal failed for %s: %v", a.node.ID, err)
 		return
 	}
 
-	resp, err := http.Post(
-		a.coordinator+"/api/heartbeat",
-		"application/json",
-		bytes.NewReader(data),
-	)
+	resp, err := a.httpClient.Post(a.coordinator+"/api/heartbeat", "application/json", bytes.NewReader(data))
 	if err != nil {
+		log.Printf("mesh heartbeat failed for %s: %v", a.node.ID, err)
 		return
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		log.Printf("mesh heartbeat rejected for %s: status %d", a.node.ID, resp.StatusCode)
+	}
 }
 
 // GetMesh gets the mesh network
