@@ -20,6 +20,8 @@ var (
 	awgConfig   *awg.Config
 )
 
+const coordinatorVersion = "0.2.0"
+
 func main() {
 	log.Println("Starting Kolibri Mesh Coordinator...")
 
@@ -130,7 +132,7 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":    "ok",
 		"app":       "Kolibri Mesh Coordinator",
-		"version":   "0.1.0",
+		"version":   coordinatorVersion,
 		"timestamp": time.Now().Format(time.RFC3339),
 	})
 }
